@@ -14,7 +14,9 @@ def parse_config(config_path):
     ret['conditions'] = conditions
     ret['binary'] = (int(config['settings']['binary_classification']) == 1)
     ret['drop_hc'] = (int(config['settings']['drop_hc_number']) == 1)
-    print(ret['drop_hc'])
+    ret['num_hidden_layers'] = int(config['model']['num_hidden_layers'])
+    ret['hidden_size'] = int(config['model']['hidden_size'])
+    ret['num_steps'] = int(config['model']['num_steps'])
     return ret
 
 def get_data(config):
