@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import snntorch as snn
 from snntorch import surrogate
+from sklearn.preprocessing import StandardScaler
 
 class SNNModel(nn.Module):    
     def __init__(self, input_size, num_hidden_layers, hidden_layers_size, output_size, num_steps, beta=0.5):
@@ -67,3 +68,45 @@ def get_model(input_size, output_size, config):
                     output_size=output_size,
                     num_steps=config['num_steps'])
     return model
+
+def spike_encoding(x, method, num_steps, gain = 0.5):
+    '''
+    Encode data to spike train
+    
+    :param x: Data to encode
+    :param method: Encoding method, one of "rate", "latency"
+    :param num_steps: Simulation steps
+    :param gain: Gain for rate encoding
+    '''
+    # naive normalization, we will prescale before encoding, this is a failsafe
+    x_min = x.min()
+    x_max = x.max()
+    x_normalized = (x - x_min) / (x_max - x_min) # if x_max is equal to x_min we failed anyway
+    
+    if method == 'rate':
+        # rate encoding: higher values = more frequent spikes
+        spikes = snn.spikegen.rate(
+            x_normalized, 
+            num_steps=num_steps, 
+            gain=gain
+        )
+    elif method == 'latency':
+        # latency encoding: higher values = earlier spikes
+        spikes = snn.spikegen.latency(
+            x_normalized, 
+            num_steps=num_steps, 
+            threshold=0.05,
+            normalize=True
+        )
+    else:
+        raise ValueError(f"not a valid encoding method - {method}")
+    
+    return spikes
+
+def preprocess_data(x, y):
+    scaler = StandardScaler() # TODO: moze lepiej recznie to zrobic, nwm co to robi dokladnie
+    x_scaled = scaler.fit_transform(x)
+    y = torch.tensor(y)
+    y = nn.functional.one_hot(y, len(torch.unique(y)))
+    x = torch.tensor(x_scaled)
+    return x, y
