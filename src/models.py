@@ -54,8 +54,16 @@ class SNNModel(nn.Module):
     
 
 def get_model(input_size, output_size, config):
+    '''
+    Get SNNModel object
+    
+    :param input_size: size of input to the model
+    :param output_size: size of model output
+    :param config: config dict
+    '''
     model = SNNModel(input_size = input_size,
                     num_hidden_layers=config['num_hidden_layers'],
                     hidden_layers_size=config['hidden_size'],
                     output_size=output_size,
                     num_steps=config['num_steps'])
+    return model
