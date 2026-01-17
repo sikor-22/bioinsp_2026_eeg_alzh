@@ -1,0 +1,5 @@
+pandas>=2.0.0
+numpy>=2.0.0
+scikit-learn>=1.7.0
+matplotlib>=3.10.0
+snntorch>=0.9.0

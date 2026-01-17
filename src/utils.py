@@ -9,7 +9,7 @@ def parse_config(config_path):
     config.read(config_path)
     ret = {}
     ret['filepath'] = config['data']['path']
-    conditions = config['settings']['conditions'].split(",")
+    conditions = config['data']['conditions'].split(",")
     conditions = [condition.strip() for condition in conditions]
     ret['conditions'] = conditions
     ret['binary'] = (int(config['settings']['binary_classification']) == 1)
