@@ -42,6 +42,8 @@ def get_data(config):
 
     subset = data[data['Condition'].isin(config['conditions'])]
     x, A = subset.loc[:, 'Fp1-1':'O2-AT_pdd'], subset['Condition']
+    x = x.astype(np.float64)
+    x = x.dropna(thresh=1, axis=1)
 
     if(config['drop_hc']):
         A = A.replace('HC3', 'HC')

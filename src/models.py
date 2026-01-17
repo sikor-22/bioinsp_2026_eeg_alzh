@@ -3,6 +3,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import snntorch as snn
+from snntorch import spikegen
 from snntorch import surrogate
 from sklearn.preprocessing import StandardScaler
 
@@ -16,6 +17,9 @@ class SNNModel(nn.Module):
         for i in range(num_hidden_layers):
             self.fclayers.append(nn.Linear(hidden_layers_size, hidden_layers_size))
             self.liflayers.append(snn.Leaky(beta=beta, spike_grad=surrogate.fast_sigmoid()))
+
+        self.fclayers = nn.ModuleList(self.fclayers)
+        self.liflayers = nn.ModuleList(self.liflayers)
         
         self.fcfirst = nn.Linear(input_size, hidden_layers_size)
         self.liffirst = snn.Leaky(beta=beta, spike_grad=surrogate.fast_sigmoid())
@@ -37,20 +41,21 @@ class SNNModel(nn.Module):
         mem_rec = []
         
         for step in range(self.num_steps):
-            cur = self.fcfirst(x)
+            cur = self.fcfirst(x[step])
             spkfirst, memfirst = self.liffirst(cur, memfirst)
             spk_hidden = spkfirst
 
             for i in range(self.num_hidden_layers):
                 cur = self.fclayers[i](spk_hidden)
-                spk_hidden, mems[i] = self.liflayers(cur, mems[i])
+                spk_hidden, mems[i] = self.liflayers[i](cur, mems[i])
             
-            curlast = self.fc3(spk_hidden)
-            spklast, memlast = self.lif3(curlast, memlast)
-            
+            curlast = self.fclast(spk_hidden)
+            spklast, memlast = self.liflast(curlast, memlast)
+
             spk_rec.append(spklast)
             mem_rec.append(memlast)
-            
+
+        
         return torch.stack(spk_rec, dim=0), torch.stack(mem_rec, dim=0)
     
 
@@ -69,7 +74,7 @@ def get_model(input_size, output_size, config):
                     num_steps=config['num_steps'])
     return model
 
-def spike_encoding(x, method, num_steps, gain = 0.5):
+def spike_encoding(x, method, num_steps, gain = 0.25):
     '''
     Encode data to spike train
     
@@ -82,17 +87,16 @@ def spike_encoding(x, method, num_steps, gain = 0.5):
     x_min = x.min()
     x_max = x.max()
     x_normalized = (x - x_min) / (x_max - x_min) # if x_max is equal to x_min we failed anyway
-    
     if method == 'rate':
         # rate encoding: higher values = more frequent spikes
-        spikes = snn.spikegen.rate(
+        spikes = spikegen.rate(
             x_normalized, 
             num_steps=num_steps, 
             gain=gain
         )
     elif method == 'latency':
         # latency encoding: higher values = earlier spikes
-        spikes = snn.spikegen.latency(
+        spikes = spikegen.latency(
             x_normalized, 
             num_steps=num_steps, 
             threshold=0.05,
@@ -107,6 +111,49 @@ def preprocess_data(x, y):
     scaler = StandardScaler() # TODO: moze lepiej recznie to zrobic, nwm co to robi dokladnie
     x_scaled = scaler.fit_transform(x)
     y = torch.tensor(y)
-    y = nn.functional.one_hot(y, len(torch.unique(y)))
-    x = torch.tensor(x_scaled)
+    y = nn.functional.one_hot(y, len(torch.unique(y))).float()
+    x = torch.tensor(x_scaled).float()
     return x, y
+
+def train_model(x, y, model, num_epochs, num_steps, encoding_method):
+    dataset = torch.utils.data.TensorDataset(x, y)
+    train_loader = torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    loss_fn = nn.CrossEntropyLoss()
+    for epoch in range(num_epochs):
+        model.train()
+        total_loss = 0
+        batch_count = 0
+        
+        for batch_X, batch_y in train_loader:
+            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+            optimizer.zero_grad()
+
+            spikes = spike_encoding(batch_X, encoding_method, num_steps)
+
+            spk_rec, mem_rec = model(spikes)
+            
+            # Sum spikes over time for classification
+            output = torch.sum(spk_rec, dim=0)
+            output = torch.softmax(output, dim=1)
+            
+            loss = loss_fn(output, batch_y)
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            batch_count += 1
+        
+        if epoch % 1 == 0:
+            model.eval()
+            with torch.no_grad():
+                x, y = x.to(device), y.to(device)
+                spikes = spike_encoding(x, encoding_method, num_steps)
+                spk_rec, mem_rec = model(spikes)
+                output = torch.sum(spk_rec, dim=0)
+                y_pred = torch.argmax(output, dim=1)
+                y_true = torch.argmax(y, dim=1)
+                accuracy = torch.sum(y_pred == y_true).float()/len(y_true)
+                print(f"Epoch: {epoch} - Acc: {accuracy*100}%")
