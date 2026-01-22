@@ -38,7 +38,10 @@ def get_data(config):
     data = pd.read_csv(config['filepath'])
     condition_subset = config['conditions']
     if(config['binary']):
-        condition_subset.remove('MCI')
+        try:
+            condition_subset.remove('MCI')
+        except ValueError:
+            pass
 
     subset = data[data['Condition'].isin(config['conditions'])]
     x, A = subset.loc[:, 'Fp1-1':'O2-AT_pdd'], subset['Condition']

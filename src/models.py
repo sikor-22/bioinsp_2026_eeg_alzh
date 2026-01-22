@@ -8,7 +8,7 @@ from snntorch import surrogate
 from sklearn.preprocessing import StandardScaler
 
 class SNNModel(nn.Module):    
-    def __init__(self, input_size, num_hidden_layers, hidden_layers_size, output_size, num_steps, beta=0.5):
+    def __init__(self, input_size, num_hidden_layers, hidden_layers_size, output_size, num_steps, beta=0.5, threshold = 0.3):
         super(SNNModel, self).__init__()
         self.num_hidden_layers = num_hidden_layers
         self.fclayers = []
@@ -16,16 +16,16 @@ class SNNModel(nn.Module):
 
         for i in range(num_hidden_layers):
             self.fclayers.append(nn.Linear(hidden_layers_size, hidden_layers_size))
-            self.liflayers.append(snn.Leaky(beta=beta, spike_grad=surrogate.fast_sigmoid()))
+            self.liflayers.append(snn.Leaky(beta=beta, spike_grad=surrogate.fast_sigmoid(), threshold = threshold))
 
         self.fclayers = nn.ModuleList(self.fclayers)
         self.liflayers = nn.ModuleList(self.liflayers)
         
         self.fcfirst = nn.Linear(input_size, hidden_layers_size)
-        self.liffirst = snn.Leaky(beta=beta, spike_grad=surrogate.fast_sigmoid())
+        self.liffirst = snn.Leaky(beta=beta, spike_grad=surrogate.fast_sigmoid(), threshold = threshold)
         
         self.fclast = nn.Linear(hidden_layers_size, output_size)
-        self.liflast = snn.Leaky(beta=beta, spike_grad=surrogate.fast_sigmoid())
+        self.liflast = snn.Leaky(beta=beta, spike_grad=surrogate.fast_sigmoid(), threshold = threshold)
         
         self.num_steps = num_steps
         self.hidden_size = hidden_layers_size
@@ -74,7 +74,7 @@ def get_model(input_size, output_size, config):
                     num_steps=config['num_steps'])
     return model
 
-def spike_encoding(x, method, num_steps, gain = 0.25):
+def spike_encoding(x, method, num_steps, gain = 0.4):
     '''
     Encode data to spike train
     
@@ -107,13 +107,50 @@ def spike_encoding(x, method, num_steps, gain = 0.25):
     
     return spikes
 
+
 def preprocess_data(x, y):
     scaler = StandardScaler() # TODO: moze lepiej recznie to zrobic, nwm co to robi dokladnie
     x_scaled = scaler.fit_transform(x)
-    y = torch.tensor(y)
-    y = nn.functional.one_hot(y, len(torch.unique(y))).float()
+    y = torch.tensor(y).long()
     x = torch.tensor(x_scaled).float()
     return x, y
+
+
+def debug_model_predictions(model, x_sample, y_sample, encoding_method, num_steps):
+    device = next(model.parameters()).device
+    model.eval()
+    
+    with torch.no_grad():
+        spikes = spike_encoding(x_sample.unsqueeze(0).to(device), encoding_method, num_steps)
+        spk_rec, mem_rec = model(spikes)
+
+        print(f"Total spikes in output layer: {torch.sum(spk_rec).item()}")
+        print(f"Spike rate per neuron: {torch.mean(spk_rec.float()).item()}")
+        
+        # Check if any neurons are dead (no spikes)
+        dead_neurons = torch.sum(spk_rec, dim=[0, 1]) == 0
+        print(f"Dead neurons (no spikes): {torch.sum(dead_neurons).item()}/{dead_neurons.numel()}")
+        
+        # Check membrane potentials
+        print(f"\nMembrane potential stats:")
+        print(f"  Min: {torch.min(mem_rec).item():.4f}")
+        print(f"  Max: {torch.max(mem_rec).item():.4f}")
+        print(f"  Mean: {torch.mean(mem_rec).item():.4f}")
+        print(f"  Std: {torch.std(mem_rec).item():.4f}")
+        
+        # Check output distribution
+        output = torch.sum(mem_rec, dim=0)
+        print(f"\nOutput logits (sum over time):")
+        print(f"  Values: {output.squeeze().cpu().numpy()}")
+        print(f"  Softmax: {torch.softmax(output, dim=1).squeeze().cpu().numpy()}")
+        
+        # Check gradients
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                print(f"{name} - grad mean: {param.grad.mean().item():.6f}, std: {param.grad.std().item():.6f}")
+            else:
+                print(f"{name} - no gradient")
+
 
 def train_model(x, y, model, num_epochs, num_steps, encoding_method):
     dataset = torch.utils.data.TensorDataset(x, y)
@@ -122,6 +159,13 @@ def train_model(x, y, model, num_epochs, num_steps, encoding_method):
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     loss_fn = nn.CrossEntropyLoss()
+
+
+    print("=== Pre-training Debug ===")
+    sample_idx = 0
+    debug_model_predictions(model, x[sample_idx], y[sample_idx], 
+                           encoding_method, num_steps)
+
     for epoch in range(num_epochs):
         model.train()
         total_loss = 0
@@ -132,13 +176,10 @@ def train_model(x, y, model, num_epochs, num_steps, encoding_method):
             optimizer.zero_grad()
 
             spikes = spike_encoding(batch_X, encoding_method, num_steps)
-
             spk_rec, mem_rec = model(spikes)
             
-            # Sum spikes over time for classification
-            output = torch.sum(spk_rec, dim=0)
-            output = torch.softmax(output, dim=1)
-            
+            # Train on membrane potentials
+            output = torch.sum(mem_rec, dim=0)
             loss = loss_fn(output, batch_y)
             loss.backward()
             optimizer.step()
@@ -154,6 +195,9 @@ def train_model(x, y, model, num_epochs, num_steps, encoding_method):
                 spk_rec, mem_rec = model(spikes)
                 output = torch.sum(spk_rec, dim=0)
                 y_pred = torch.argmax(output, dim=1)
-                y_true = torch.argmax(y, dim=1)
-                accuracy = torch.sum(y_pred == y_true).float()/len(y_true)
-                print(f"Epoch: {epoch} - Acc: {accuracy*100}%")
+                accuracy = torch.sum(y_pred == y).float()/len(y)
+                print(f"Epoch: {epoch} - Acc: {accuracy*100:.2f}%")
+        if epoch % 10 == 0:
+            print(f"\n=== Debug at Epoch {epoch} ===")
+            debug_model_predictions(model, batch_X[0], batch_y[0], 
+                                   encoding_method, num_steps)
