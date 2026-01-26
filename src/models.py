@@ -5,49 +5,73 @@ import torch.nn as nn
 import snntorch as snn
 from snntorch import spikegen
 from snntorch import surrogate
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 
-class SNNModel(nn.Module):    
-    def __init__(self, input_size, num_hidden_layers, hidden_layers_size, output_size, num_steps, beta=0.8, threshold = 0.2, learnable_beta = True, learnable_threshold = True):
+class SNNModel(nn.Module):
+    """
+    Spiking Neural Network with learnable LIF neuron parameters.
+    
+    Args:
+        input_size: Number of input features
+        num_hidden_layers: Number of hidden layers
+        hidden_layers_size: Size of each hidden layer
+        output_size: Number of output classes
+        num_steps: Number of time steps for simulation
+        beta: decay rate
+        threshold: spike threshold
+    """   
+    def __init__(self, input_size, num_hidden_layers, hidden_layers_size, output_size, num_steps, beta=0.9, threshold = 0.5):
         super(SNNModel, self).__init__()
         self.num_hidden_layers = num_hidden_layers
         self.fclayers = []
         self.liflayers = []
-
+        
+        self.fcfirst = nn.Linear(input_size, hidden_layers_size)
+        self.liffirst = snn.Leaky(beta=beta, spike_grad=surrogate.fast_sigmoid(), threshold=threshold)
+        
         for i in range(num_hidden_layers):
             self.fclayers.append(nn.Linear(hidden_layers_size, hidden_layers_size))
-            self.liflayers.append(snn.Leaky(beta=beta, spike_grad=surrogate.fast_sigmoid(), threshold = threshold))
+            self.liflayers.append(snn.Leaky(beta=beta, spike_grad=surrogate.fast_sigmoid(), threshold=threshold))
 
         self.fclayers = nn.ModuleList(self.fclayers)
         self.liflayers = nn.ModuleList(self.liflayers)
         
-        self.fcfirst = nn.Linear(input_size, hidden_layers_size)
-        self.liffirst = snn.Leaky(beta=beta, spike_grad=surrogate.fast_sigmoid(), threshold = threshold)
+        self.dropout = nn.Dropout(0.5)
         
         self.fclast = nn.Linear(hidden_layers_size, output_size)
-        self.liflast = snn.Leaky(beta=beta, spike_grad=surrogate.fast_sigmoid(), threshold = threshold)
+        self.liflast = snn.Leaky(beta=beta, spike_grad=surrogate.fast_sigmoid(), threshold=threshold, output=True)
         
         self.num_steps = num_steps
-        self.hidden_size = hidden_layers_size
         
     def forward(self, x):
+        """
+        Forward pass through the network.
+        
+        Args:
+            x: Input tensor of shape [num_steps, batch_size, input_size]
+            
+        Returns:
+            spk_rec: Spike recordings of shape [num_steps, batch_size, output_size]
+            mem_rec: Membrane potential recordings of shape [num_steps, batch_size, output_size]
+        """
+        
         memfirst = self.liffirst.init_leaky()
-        mems = []
-        for lif in self.liflayers:
-            mems.append(lif.init_leaky())
+        mems = [lif.init_leaky() for lif in self.liflayers]
         memlast = self.liflast.init_leaky()
         
         spk_rec = []
         mem_rec = []
         
         for step in range(self.num_steps):
-            cur = self.fcfirst(x[step])
+            inp = x[step]
+            cur = self.fcfirst(inp)
             spkfirst, memfirst = self.liffirst(cur, memfirst)
-            spk_hidden = spkfirst
+            spk_hidden = self.dropout(spkfirst)
 
             for i in range(self.num_hidden_layers):
                 cur = self.fclayers[i](spk_hidden)
                 spk_hidden, mems[i] = self.liflayers[i](cur, mems[i])
+                spk_hidden = self.dropout(spk_hidden)
             
             curlast = self.fclast(spk_hidden)
             spklast, memlast = self.liflast(curlast, memlast)
@@ -55,204 +79,194 @@ class SNNModel(nn.Module):
             spk_rec.append(spklast)
             mem_rec.append(memlast)
 
-        
         return torch.stack(spk_rec, dim=0), torch.stack(mem_rec, dim=0)
+
+class SNNModelLearnable(nn.Module):
+    """
+    Spiking Neural Network with learnable LIF neuron parameters.
     
-
-class SNNSimpleModel(nn.Module):    
-    def __init__(self, input_size, hidden_layers_size, output_size, num_steps, beta=0.8, threshold = 0.3):
-        super(SNNSimpleModel, self).__init__()       
+    Args:
+        input_size: Number of input features
+        num_hidden_layers: Number of hidden layers
+        hidden_layers_size: Size of each hidden layer
+        output_size: Number of output classes
+        num_steps: Number of time steps for simulation
+        beta: Initial decay rate (learnable)
+        threshold: Initial spike threshold (learnable)
+    """
+    
+    def __init__(self, input_size, num_hidden_layers, hidden_layers_size, output_size, num_steps, beta=0.9, threshold=0.5):
+        super(SNNModelLearnable, self).__init__()
+        self.num_hidden_layers = num_hidden_layers
+        self.num_steps = num_steps
+        
+        beta_init = torch.tensor([beta], dtype=torch.float32)
+        threshold_init = torch.tensor([threshold], dtype=torch.float32)
+        
         self.fcfirst = nn.Linear(input_size, hidden_layers_size)
-        self.liffirst = snn.Leaky(beta=beta, spike_grad=surrogate.fast_sigmoid(), threshold = threshold)
-
-        self.fchidden = nn.Linear(hidden_layers_size, hidden_layers_size)
-        self.lifhidden = snn.Leaky(beta=beta, spike_grad=surrogate.fast_sigmoid(), threshold = threshold)
+        self.liffirst = snn.Leaky(beta=nn.Parameter(beta_init.clone()), 
+                                   spike_grad=surrogate.fast_sigmoid(), 
+                                   threshold=nn.Parameter(threshold_init.clone()))
+        
+        self.fclayers = nn.ModuleList([
+            nn.Linear(hidden_layers_size, hidden_layers_size) 
+            for _ in range(num_hidden_layers)
+        ])
+        self.liflayers = nn.ModuleList([
+            snn.Leaky(beta=nn.Parameter(beta_init.clone()), 
+                      spike_grad=surrogate.fast_sigmoid(), 
+                      threshold=nn.Parameter(threshold_init.clone()))
+            for _ in range(num_hidden_layers)
+        ])
+        
+        self.dropout = nn.Dropout(0.5)
         
         self.fclast = nn.Linear(hidden_layers_size, output_size)
-        self.liflast = snn.Leaky(beta=beta, spike_grad=surrogate.fast_sigmoid(), threshold = threshold)
-        
-        self.num_steps = num_steps
-        self.hidden_size = hidden_layers_size
-
-        nn.init.xavier_uniform_(self.fcfirst.weight, gain=2.0)
-        nn.init.xavier_uniform_(self.fchidden.weight, gain=2.0)
-        nn.init.xavier_uniform_(self.fclast.weight, gain=2.0)
+        self.liflast = snn.Leaky(beta=nn.Parameter(beta_init.clone()), 
+                                  spike_grad=surrogate.fast_sigmoid(), 
+                                  threshold=nn.Parameter(threshold_init.clone()),
+                                  output=True)
         
     def forward(self, x):
+        """
+        Forward pass through the network.
+        
+        Args:
+            x: Input tensor of shape [num_steps, batch_size, input_size]
+            
+        Returns:
+            spk_rec: Spike recordings of shape [num_steps, batch_size, output_size]
+            mem_rec: Membrane potential recordings of shape [num_steps, batch_size, output_size]
+        """
         memfirst = self.liffirst.init_leaky()
-        memhidden = self.lifhidden.init_leaky()
+        mems = [lif.init_leaky() for lif in self.liflayers]
         memlast = self.liflast.init_leaky()
         
         spk_rec = []
         mem_rec = []
         
         for step in range(self.num_steps):
-            cur = self.fcfirst(x[step])
+            inp = x[step]
+            cur = self.fcfirst(inp)
             spkfirst, memfirst = self.liffirst(cur, memfirst)
+            spk_hidden = self.dropout(spkfirst)
 
-            spkhidden = self.fchidden(spkfirst)
-            spkhidden, memhidden = self.lifhidden(spkhidden, memhidden)
-
-            curlast = self.fclast(spkhidden)
+            for i in range(self.num_hidden_layers):
+                cur = self.fclayers[i](spk_hidden)
+                spk_hidden, mems[i] = self.liflayers[i](cur, mems[i])
+                spk_hidden = self.dropout(spk_hidden)
+            
+            curlast = self.fclast(spk_hidden)
             spklast, memlast = self.liflast(curlast, memlast)
 
             spk_rec.append(spklast)
             mem_rec.append(memlast)
 
-        
         return torch.stack(spk_rec, dim=0), torch.stack(mem_rec, dim=0)
-    
+
 
 def get_model(input_size, output_size, config):
     '''
     Get SNNModel object
-    
-    :param input_size: size of input to the model
-    :param output_size: size of model output
-    :param config: config dict
     '''
     model = SNNModel(input_size = input_size,
-                    num_hidden_layers=config['num_hidden_layers'],
-                    hidden_layers_size=config['hidden_size'],
+                    num_hidden_layers=config.get('num_hidden_layers', 1),
+                    hidden_layers_size=config.get('hidden_size', 100),
                     output_size=output_size,
-                    num_steps=config['num_steps'])
+                    num_steps=config.get('num_steps', 25))
     return model
 
-def spike_encoding(x, method, num_steps, gain = 0.45):
+def spike_encoding(x, method, num_steps, gain = 0.5):
     '''
-    Encode data to spike train
+    Encode data to spike train. 
+    ASSUMES X IS ALREADY NORMALIZED appropriately (e.g. 0-1 for latency).
+    '''
     
-    :param x: Data to encode
-    :param method: Encoding method, one of "rate", "latency"
-    :param num_steps: Simulation steps
-    :param gain: Gain for rate encoding
-    '''
-    # naive normalization, we will prescale before encoding, this is a failsafe
-    x_min = x.min()
-    x_max = x.max()
-    x_normalized = (x - x_min) / (x_max - x_min) # if x_max is equal to x_min we failed anyway
     if method == 'rate':
-        # rate encoding: higher values = more frequent spikes
-        spikes = spikegen.rate(
-            x_normalized, 
-            num_steps=num_steps, 
-            gain=gain
-        )
+        spikes = spikegen.rate(x, num_steps=num_steps, gain=gain)
     elif method == 'latency':
-        # latency encoding: higher values = earlier spikes
-        spikes = spikegen.latency(
-            x_normalized, 
-            num_steps=num_steps, 
-            threshold=0.05,
-            normalize=True
-        )
+        spikes = spikegen.latency(x, num_steps=num_steps, tau=5, threshold=0.01, normalize=True, clip=True)
     else:
-        raise ValueError(f"not a valid encoding method - {method}")
+        raise ValueError(f"Unknown encoding method: {method}")
     
     return spikes
 
-
 def preprocess_data(x, y):
-    scaler = StandardScaler() # TODO: moze lepiej recznie to zrobic, nwm co to robi dokladnie
+    scaler = MinMaxScaler() 
     x_scaled = scaler.fit_transform(x)
+    
     y = torch.tensor(y).long()
     x = torch.tensor(x_scaled).float()
     return x, y
 
-
-def debug_model_predictions(model, x_sample, y_sample, encoding_method, num_steps):
-    device = next(model.parameters()).device
-    model.eval()
-    
-    with torch.no_grad():
-        spikes = spike_encoding(x_sample.unsqueeze(0).to(device), encoding_method, num_steps)
-        spk_rec, mem_rec = model(spikes)
-
-        print(f"Total spikes in output layer: {torch.sum(spk_rec).item()}")
-        print(f"Spike rate per neuron: {torch.mean(spk_rec.float()).item()}")
-        
-        # Check if any neurons are dead (no spikes)
-        dead_neurons = torch.sum(spk_rec, dim=[0, 1]) == 0
-        print(f"Dead neurons (no spikes): {torch.sum(dead_neurons).item()}/{dead_neurons.numel()}")
-        
-        # Check membrane potentials
-        print(f"\nMembrane potential stats:")
-        print(f"  Min: {torch.min(mem_rec).item():.4f}")
-        print(f"  Max: {torch.max(mem_rec).item():.4f}")
-        print(f"  Mean: {torch.mean(mem_rec).item():.4f}")
-        print(f"  Std: {torch.std(mem_rec).item():.4f}")
-        
-        # Check output distribution
-        output = torch.sum(mem_rec, dim=0)
-        print(f"\nOutput logits (sum over time):")
-        print(f"  Values: {output.squeeze().cpu().numpy()}")
-        print(f"  Softmax: {torch.softmax(output, dim=1).squeeze().cpu().numpy()}")
-        
-        # Check gradients
-        for name, param in model.named_parameters():
-            if param.grad is not None:
-                print(f"{name} - grad mean: {param.grad.mean().item():.6f}, std: {param.grad.std().item():.6f}")
-            else:
-                print(f"{name} - no gradient")
-
-
-def train_model(x, y, x_val, y_val, model, num_epochs, num_steps, encoding_method, debug_prints = False, output_temp = 5.0):
-    dataset = torch.utils.data.TensorDataset(x, y)
-    train_loader = torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=True)
+def train_model(x_train, y_train, x_val, y_val, model, num_epochs, num_steps, encoding_method, save_path='best_model.pth', class_weights=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Training on {device}")
     model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    loss_fn = nn.CrossEntropyLoss()
 
+    wd = 1e-2 if encoding_method == 'rate' else 1e-5
 
-    if debug_prints:
-        sample_idx = 0
-        debug_model_predictions(model, x[sample_idx], y[sample_idx], 
-                            encoding_method, num_steps)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, betas=(0.9, 0.999), weight_decay=wd)
+
+    if class_weights is not None:
+        class_weights = class_weights.to(device)
+    loss_fn = nn.CrossEntropyLoss(weight=class_weights)
+    
+    train_dataset = torch.utils.data.TensorDataset(x_train, y_train)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=32, shuffle=True)
+    
+    val_dataset = torch.utils.data.TensorDataset(x_val, y_val)
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=32, shuffle=False)
+    
+    best_val_acc = 0.0
+    history = {'train_loss': [], 'val_acc': []}
 
     for epoch in range(num_epochs):
         model.train()
         total_loss = 0
-        batch_count = 0
         
-        for batch_X, batch_y in train_loader:
-            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+        for batch_x, batch_y in train_loader:
+            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
             optimizer.zero_grad()
-
-            spikes = spike_encoding(batch_X, encoding_method, num_steps)
-            spk_rec, mem_rec = model(spikes)
+            spikes_in = spike_encoding(batch_x, encoding_method, num_steps)
+            spk_out, mem_out = model(spikes_in)
+            output_logits = torch.mean(mem_out, dim=0)
             
-            # Train on membrane potentials
-            output = torch.mean(mem_rec, dim=0)
-            loss = loss_fn(output/output_temp, batch_y)
+            loss = loss_fn(output_logits, batch_y)
             loss.backward()
             optimizer.step()
             
             total_loss += loss.item()
-            batch_count += 1
+            
+        avg_loss = total_loss / len(train_loader)
+        history['train_loss'].append(avg_loss)
         
-        if epoch % 1 == 0:
-            model.eval()
-            with torch.no_grad():
-                # training set
-                x, y = x.to(device), y.to(device)
-                spikes = spike_encoding(x, encoding_method, num_steps)
-                spk_rec, mem_rec = model(spikes)
-                output = torch.sum(spk_rec, dim=0)
-                y_pred = torch.argmax(output, dim=1)
-                accuracy = torch.sum(y_pred == y).float()/len(y)
-                print(f"Epoch: {epoch} - Train Acc: {accuracy*100:.2f}%")
-                # validation set
-                x_val, y_val = x_val.to(device), y_val.to(device)
-                spikes = spike_encoding(x_val, encoding_method, num_steps)
-                spk_rec, mem_rec = model(spikes)
-                output = torch.sum(spk_rec, dim=0)
-                y_pred = torch.argmax(output, dim=1)
-                val_accuracy = torch.sum(y_pred == y_val).float()/len(y_val)
-                print(f"Epoch: {epoch} - Val Acc: {val_accuracy*100:.2f}%")
-                print()
-
-        if epoch % 10 == 0 and debug_prints:
-            print(f"\n=== Debug at Epoch {epoch} ===")
-            debug_model_predictions(model, batch_X[0], batch_y[0], 
-                                   encoding_method, num_steps)
+        # Validation
+        model.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for batch_x, batch_y in val_loader:
+                batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+                
+                spikes_in = spike_encoding(batch_x, encoding_method, num_steps)
+                spk_out, mem_out = model(spikes_in)
+            
+                output_rates = torch.sum(spk_out, dim=0)
+                _, predicted = torch.max(output_rates, 1)
+                
+                total += batch_y.size(0)
+                correct += (predicted == batch_y).sum().item()
+        
+        val_acc = 100 * correct / total
+        history['val_acc'].append(val_acc)
+        
+        print(f"Epoch {epoch+1}/{num_epochs} \t Loss: {avg_loss:.4f} \t Val Acc: {val_acc:.2f}%")
+        
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save(model.state_dict(), save_path)
+            # print("Saved best model")
+            
+    print(f"Training finished. Best Val Acc: {best_val_acc:.2f}%")
+    return history

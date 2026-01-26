@@ -210,3 +210,6 @@ __marimo__/
 # Custom - add here
 debug.py
 results/
+output/
+output2/
+data/
